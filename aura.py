@@ -3,32 +3,11 @@ import json
 import base64
 import threading
 import webbrowser
-import subprocess
-import sys
-
-try:
-    import flask
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "flask"])
-    import flask
-
-try:
-    import yt_dlp
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "yt_dlp"])
-    import yt_dlp
-
-try:
-    import flask_socketio
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "flask-socketio"])
-    import flask_socketio
-
 from flask import Flask, render_template_string, request, jsonify
-from flask_socketio import SocketIO, emit
+import yt_dlp
 
+# --- Flask App Initialization ---
 app = Flask(__name__)
-socketio = SocketIO(app)
 
 # --- Helper Functions ---
 def get_audio_files_and_data():
@@ -45,25 +24,32 @@ def get_audio_files_and_data():
     return audio_files, audio_data
 
 # --- Backend Logic ---
-def check_ffmpeg():
+def download_audio_backend(query, source):
+    """Downloads audio using yt-dlp."""
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'}],
+        'outtmpl': '%(title)s.%(ext)s',
+        'quiet': True,
+        'default_search': source,
+    }
     try:
-        subprocess.run(['ffmpeg', '-version'], check=True, capture_output=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return False
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([query])
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
-def install_ffmpeg():
+def delete_song_backend(filename):
+    """Deletes a song file."""
     try:
-        print("ffmpeg not found. Attempting to install...")
-        subprocess.check_call(["pkg", "install", "ffmpeg", "-y"])
-        print("ffmpeg installed successfully.")
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to install ffmpeg: {e}")
-        sys.exit(1)
-
-
-
-
+        if os.path.exists(filename):
+            os.remove(filename)
+            return {"status": "success"}
+        else:
+            return {"status": "error", "message": f"File '{filename}' not found."}
+    except Exception as e:
+        return {"status": "error", "message": f"Deletion failed: {str(e)}"}
 
 # --- Flask Routes ---
 @app.route('/')
@@ -76,66 +62,20 @@ def get_audio_files():
     files, data = get_audio_files_and_data()
     return jsonify({"files": files, "data": data})
 
-def download_audio_thread(query, source, socketio_instance):
-    """Target for the download thread to wrap the backend function."""
-    download_audio_backend(query, source, socketio_instance)
-
-@socketio.on('download_song')
-def handle_download_song(data):
+@app.route('/api/download', methods=['POST'])
+def download():
+    data = request.json
     query = data.get('query')
-    source = 'ytsearch'
-    if 'youtube.com' in query or 'youtu.be' in query:
-        source = 'youtube'
-    elif 'soundcloud.com' in query:
-        source = 'soundcloud'
-    threading.Thread(target=download_audio_thread, args=(query, source, socketio)).start()
+    source = data.get('source')
+    result = download_audio_backend(query, source)
+    return jsonify(result)
 
-
-def download_audio_backend(query, source, socketio):
-    """Downloads audio using yt-dlp."""
-    if not check_ffmpeg():
-        install_ffmpeg()
-
-    def progress_hook(d):
-        if d['status'] == 'downloading':
-            filename = d['filename']
-            total_bytes = d.get('total_bytes') or d.get('total_bytes_estimate')
-            if total_bytes:
-                percentage = d['downloaded_bytes'] / total_bytes * 100
-                speed = d.get('speed') or 0
-                socketio.emit('download_progress', {'filename': filename, 'percentage': percentage, 'total_mb': total_bytes / 1024 / 1024, 'speed_kb': speed / 1024})
-        elif d['status'] == 'finished':
-            filename = d['filename']
-            socketio.emit('download_finished', {'filename': filename})
-
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192'
-        }],
-        'outtmpl': '%(title)s.%(ext)s',
-        'progress_hooks': [progress_hook],
-        'default_search': source,
-        'noplaylist': False,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(query, download=False)
-            if 'entries' in info:
-                for entry in info['entries']:
-                    filename = ydl.prepare_filename(entry).replace('.webm', '.mp3').replace('.m4a', '.mp3')
-                    socketio.emit('download_start', {'filename': filename})
-                    ydl.download([entry['webpage_url']])
-            else:
-                filename = ydl.prepare_filename(info).replace('.webm', '.mp3').replace('.m4a', '.mp3')
-                socketio.emit('download_start', {'filename': filename})
-                ydl.download([query])
-    except Exception as e:
-        socketio.emit('download_error', {'message': str(e), 'filename': 'unknown'})
-
-
+@app.route('/api/delete', methods=['POST'])
+def delete():
+    data = request.json
+    filename = data.get('filename')
+    result = delete_song_backend(filename)
+    return jsonify(result)
 
 # --- COMPLETE HTML, CSS, AND JAVASCRIPT IN ONE BLOCK ---
 html_template = """
@@ -144,66 +84,11 @@ html_template = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.2/socket.io.js"></script>
     <title>Studio AURA</title>
-    <style>
-        #download-queue {
-            margin-bottom: 24px;
-        }
-        .download-item {
-            display: grid;
-            grid-template-columns: 40px 1fr 100px;
-            align-items: center;
-            padding: 12px 8px;
-            border-radius: 6px;
-            background: var(--bg-secondary);
-            margin-bottom: 8px;
-        }
-        .download-item .icon {
-            width: 40px;
-            height: 40px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .download-item .info .title {
-            font-weight: 500;
-        }
-        .download-item .info .status {
-            font-size: 0.8rem;
-            color: var(--text-secondary);
-        }
-        .download-item .progress-bar {
-            width: 100%;
-            height: 6px;
-            background: var(--bg-tertiary);
-            border-radius: 3px;
-            overflow: hidden;
-        }
-        .download-item .progress-bar-fill {
-            width: 0%;
-            height: 100%;
-            background: var(--accent-primary);
-            transition: width 0.1s ease-in-out;
-        }
-        .install-animation {
-            width: 40px;
-            height: 40px;
-            border-radius: 50%;
-            border: 3px solid var(--bg-tertiary);
-            border-top-color: var(--accent-primary);
-            animation: spin 1s linear infinite;
-        }
-        @keyframes spin {
-            to {
-                transform: rotate(360deg);
-            }
-        }
-    </style>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;700&display=swap');
         :root {
-            --bg-base: #000000;
+            --bg-sidebar: #000000;
             --bg-main: #121212;
             --bg-secondary: #181818;
             --bg-tertiary: #282828;
@@ -214,319 +99,69 @@ html_template = """
             --text-secondary: #b3b3b3;
         }
         * { box-sizing: border-box; margin: 0; padding: 0; }
-        body, html {
-            background-color: var(--bg-base);
-            font-family: 'Inter', sans-serif;
-            overflow: hidden;
-            color: var(--text-primary);
-        }
-        .workstation-container {
-            width: 100%;
-            height: 100vh;
-            display: grid;
-            grid-template-columns: 80px 1fr 300px;
-            grid-template-rows: 1fr;
-            grid-template-areas: "sidebar main player";
-            transition: grid-template-columns 0.3s ease;
-        }
+        body, html { background-color: var(--bg-main); font-family: 'Inter', sans-serif; overflow: hidden; color: var(--text-primary); }
+        .workstation-container { width: 100%; height: 100vh; display: grid; grid-template-rows: 1fr auto; grid-template-columns: 80px 1fr; grid-template-areas: "sidebar main" "player player"; transition: grid-template-columns 0.3s ease; }
 
         /* Sidebar */
-        .sidebar {
-            grid-area: sidebar;
-            background: var(--bg-base);
-            padding: 24px 8px;
-            display: flex;
-            flex-direction: column;
-        }
-        .sidebar-header {
-            padding: 0 16px 16px;
-            font-size: 1.5rem;
-            font-weight: 700;
-            white-space: nowrap;
-            overflow: hidden;
-        }
+        .sidebar { grid-area: sidebar; background: var(--bg-sidebar); padding: 24px 8px; display: flex; flex-direction: column; }
+        .sidebar-header { padding: 0 16px 16px; font-size: 1.5rem; font-weight: 700; white-space: nowrap; overflow: hidden; }
         .sidebar-header .icon-only { display: none; }
         .sidebar-header .full-text { display: none; }
-        .nav-item {
-            padding: 12px 16px;
-            border-radius: 6px;
-            cursor: pointer;
-            font-weight: 500;
-            transition: background 0.2s ease, color 0.2s ease;
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            color: var(--text-secondary);
-        }
-        .nav-item-text {
-            white-space: nowrap;
-            opacity: 0;
-            transition: opacity 0.3s ease;
-        }
-        .nav-item:hover {
-            background: var(--bg-tertiary);
-            color: var(--text-primary);
-        }
-        .nav-item.active {
-            background: var(--bg-tertiary);
-            color: var(--accent-primary);
-        }
-        .nav-item.active svg {
-            filter: drop-shadow(0 0 5px var(--accent-primary));
-        }
-        .nav-item svg {
-            width: 24px;
-            height: 24px;
-            transition: color 0.2s, filter 0.2s;
-            flex-shrink: 0;
-        }
+        .nav-item { padding: 12px 16px; border-radius: 6px; cursor: pointer; font-weight: 500; transition: background 0.2s ease, color 0.2s ease; display: flex; align-items: center; gap: 16px; color: var(--text-secondary); }
+        .nav-item-text { white-space: nowrap; opacity: 0; transition: opacity 0.3s ease; }
+        .nav-item:hover { background: var(--bg-tertiary); color: var(--text-primary);}
+        .nav-item.active { background: var(--bg-tertiary); color: var(--accent-primary); }
+        .nav-item.active svg { filter: drop-shadow(0 0 5px var(--accent-primary)); }
+        .nav-item svg { width: 24px; height: 24px; transition: color 0.2s, filter 0.2s; flex-shrink: 0; }
 
         /* Expanded Sidebar on wide screens */
         @media (min-width: 1024px) {
-            .workstation-container {
-                grid-template-columns: 240px 1fr 300px;
-            }
+            .workstation-container { grid-template-columns: 240px 1fr; }
             .sidebar-header .full-text { display: block; }
             .nav-item-text { opacity: 1; }
         }
 
         /* Main Content */
-        .main-content {
-            grid-area: main;
-            background: var(--bg-main);
-            overflow-y: auto;
-        }
-        .page {
-            display: none;
-            padding: 24px 32px;
-        }
-        .page.active {
-            display: block;
-        }
-        .page h1 {
-            font-size: 2.5rem;
-            font-weight: 700;
-            margin-bottom: 24px;
-        }
+        .main-content { grid-area: main; background: var(--bg-main); overflow-y: auto; }
+        .page { display: none; padding: 24px 32px; }
+        .page.active { display: block; }
+        .page h1 { font-size: 2.5rem; font-weight: 700; margin-bottom: 24px; }
 
         /* Library Page */
-        #search-library {
-            width: 100%;
-            max-width: 400px;
-            background: var(--bg-tertiary);
-            border: none;
-            color: var(--text-primary);
-            padding: 12px 16px;
-            border-radius: 6px;
-            margin-bottom: 24px;
-            font-size: 0.9rem;
-        }
-        .song-list-item {
-            display: grid;
-            grid-template-columns: 40px 1fr 40px;
-            align-items: center;
-            padding: 12px 8px;
-            border-radius: 6px;
-            transition: background 0.2s;
-        }
-        .song-list-item:hover {
-            background: rgba(255,255,255,0.1);
-        }
-        .play-btn, .delete-btn {
-            background: none;
-            border: none;
-            color: var(--text-secondary);
-            cursor: pointer;
-            transition: color 0.2s;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }
-        .play-btn svg, .delete-btn svg {
-            width: 20px;
-            height: 20px;
-        }
-        .song-list-item:hover .play-btn, .song-list-item:hover .delete-btn {
-            color: var(--text-primary);
-        }
+        #search-library { width: 100%; max-width: 400px; background: var(--bg-tertiary); border: none; color: var(--text-primary); padding: 12px 16px; border-radius: 6px; margin-bottom: 24px; font-size: 0.9rem; }
+        .song-list-item { display: grid; grid-template-columns: 40px 1fr 40px; align-items: center; padding: 12px 8px; border-radius: 6px; transition: background 0.2s; }
+        .song-list-item:hover { background: rgba(255,255,255,0.1); }
+        .play-btn, .delete-btn { background: none; border: none; color: var(--text-secondary); cursor: pointer; transition: color 0.2s; display: flex; align-items: center; justify-content: center; }
+        .play-btn svg, .delete-btn svg { width: 20px; height: 20px; }
+        .song-list-item:hover .play-btn, .song-list-item:hover .delete-btn { color: var(--text-primary); }
 
         /* Downloader Page */
-        .downloader-container {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            text-align: center;
-            height: 70vh;
-        }
-        .download-form {
-            display: flex;
-            width: 100%;
-            max-width: 600px;
-        }
-        .downloader-input {
-            flex-grow: 1;
-            border: 1px solid var(--border-color);
-            background: var(--bg-secondary);
-            color: var(--text-primary);
-            padding: 15px;
-            font-size: 1rem;
-            border-radius: 50px 0 0 50px;
-            border-right: none;
-        }
-        .download-button {
-            background: var(--accent-primary);
-            color: white;
-            border: none;
-            padding: 15px 30px;
-            border-radius: 0 50px 50px 0;
-            font-weight: bold;
-            font-size: 1rem;
-            cursor: pointer;
-        }
+        .downloader-container { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; height: 70vh; }
+        .download-form { display: flex; width: 100%; max-width: 600px; }
+        .downloader-input { flex-grow: 1; border: 1px solid var(--border-color); background: var(--bg-secondary); color: var(--text-primary); padding: 15px; font-size: 1rem; border-radius: 50px 0 0 50px; border-right: none; }
+        .download-button { background: var(--accent-primary); color: white; border: none; padding: 15px 30px; border-radius: 0 50px 50px 0; font-weight: bold; font-size: 1rem; cursor: pointer; }
 
         /* Effects Page */
-        #effects-container {
-            display: flex;
-            flex-direction: column;
-            gap: 24px;
-            max-width: 600px;
-        }
-        .effect-module {
-            background: var(--bg-secondary);
-            border-radius: 12px;
-            padding: 20px;
-        }
-        .effect-module h3 {
-            font-weight: 700;
-            margin-bottom: 8px;
-            border-bottom: 1px solid var(--border-color);
-            padding-bottom: 12px;
-            margin-bottom: 16px;
-        }
-        .slider-group {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-            width:100%;
-        }
-        .slider-label-group {
-            display: flex;
-            justify-content: space-between;
-            font-weight: 500;
-            font-size: 1rem;
-        }
-        .custom-slider {
-            -webkit-appearance: none;
-            width: 100%;
-            height: 4px;
-            background: var(--bg-tertiary);
-            border-radius: 2px;
-            outline: none;
-        }
-        .custom-slider::-webkit-slider-thumb {
-            -webkit-appearance: none;
-            appearance: none;
-            width: 20px;
-            height: 20px;
-            background: var(--text-primary);
-            border-radius: 50%;
-            cursor: pointer;
-        }
+        #effects-container { display: flex; flex-direction: column; gap: 24px; max-width: 600px; }
+        .effect-module { background: var(--bg-secondary); border-radius: 12px; padding: 20px; }
+        .effect-module h3 { font-weight: 700; margin-bottom: 8px; border-bottom: 1px solid var(--border-color); padding-bottom: 12px; margin-bottom: 16px; }
+        .slider-group { display: flex; flex-direction: column; gap: 10px; width:100%; }
+        .slider-label-group { display: flex; justify-content: space-between; font-weight: 500; font-size: 1rem; }
+        .custom-slider { -webkit-appearance: none; width: 100%; height: 4px; background: var(--bg-tertiary); border-radius: 2px; outline: none; }
+        .custom-slider::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 20px; height: 20px; background: var(--text-primary); border-radius: 50%; cursor: pointer; }
 
         /* Player Bar */
-        .player-bar {
-            grid-area: player;
-            background: var(--bg-player);
-            padding: 24px;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: space-between;
-            gap: 20px;
-        }
-        #visualizer-canvas {
-            width: 100%;
-            height: 150px;
-            background-color: var(--bg-secondary);
-            border-radius: 12px;
-        }
-        #progress-bar-wrapper {
-            width: 100%;
-            height: 3px;
-            background-color: var(--bg-tertiary);
-            cursor: pointer;
-        }
-        #progress-bar-fill {
-            width: 0%;
-            height: 100%;
-            background-color: var(--accent-primary);
-            border-radius: 0 3px 3px 0;
-        }
-        .current-track-info {
-            font-weight: 500;
-            text-align: center;
-        }
-        .player-controls {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            gap: 20px;
-        }
-        .control-btn {
-            background: none;
-            border: none;
-            color: var(--text-secondary);
-            cursor: pointer;
-            transition: color 0.2s;
-        }
-        .control-btn:hover {
-            color: var(--text-primary);
-        }
-        .control-btn.play-pause-btn {
-            background-color: var(--text-primary);
-            color: #000;
-            width: 48px;
-            height: 48px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            transition: all 0.2s;
-        }
-        .control-btn.play-pause-btn:hover {
-            transform: scale(1.05);
-        }
-        .control-btn svg {
-            width: 24px;
-            height: 24px;
-        }
-        .secondary-controls {
-            display: flex;
-            align-items: center;
-            gap: 20px;
-            justify-content: center;
-            width: 100%;
-        }
-        #volume-slider {
-            width: 100%;
-        }
-        #eq-container {
-            display: grid;
-            grid-template-columns: repeat(10, 1fr);
-            gap: 10px;
-            width: 100%;
-        }
-        .eq-band {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-        }
-        .eq-band input[type=range] {
-            -webkit-appearance: slider-vertical;
-            width: 8px;
-            height: 100px;
-        }
+        .player-bar { grid-area: player; background: var(--bg-player); height: 100px; padding: 0 24px; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; border-top: 1px solid var(--border-color); position: relative; }
+        #progress-bar-wrapper { position: absolute; top: 0; left: 0; width: 100%; height: 3px; background-color: var(--bg-tertiary); cursor: pointer; }
+        #progress-bar-fill { width: 0%; height: 100%; background-color: var(--accent-primary); border-radius: 0 3px 3px 0; }
+        .current-track-info { font-weight: 500; }
+        .player-controls { display: flex; justify-content: center; align-items: center; gap: 20px; }
+        .control-btn { background: none; border: none; color: var(--text-secondary); cursor: pointer; transition: color 0.2s; }
+        .control-btn:hover { color: var(--text-primary); }
+        .control-btn.play-pause-btn { background-color: var(--text-primary); color: #000; width: 48px; height: 48px; border-radius: 50%; display: flex; align-items: center; justify-content: center; transition: all 0.2s; }
+        .control-btn.play-pause-btn:hover { transform: scale(1.05); }
+        .control-btn svg { width: 24px; height: 24px; }
+        .secondary-controls { display: flex; align-items: center; gap: 20px; justify-content: flex-end; }
     </style>
 </head>
 <body>
@@ -535,34 +170,38 @@ html_template = """
             <div class="sidebar-header"><span class="full-text">Studio AURA</span></div>
             <div class="nav-item active" data-page="library-page"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg><span class="nav-item-text">Library</span></div>
             <div class="nav-item" data-page="effects-page"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z"></path></svg><span class="nav-item-text">Effects</span></div>
-            
+            <div class="nav-item" data-page="youtube-page"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg><span class="nav-item-text">YouTube</span></div>
+            <div class="nav-item" data-page="soundcloud-page"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg><span class="nav-item-text">SoundCloud</span></div>
         </div>
         <main class="main-content">
             <section id="library-page" class="page active">
                 <h1>Music Library</h1>
-                <input type="text" id="search-library" placeholder="Paste a YouTube or SoundCloud URL to download...">
-                <div id="download-queue"></div>
+                <input type="text" id="search-library" placeholder="Filter songs...">
                 <div id="song-list"></div>
             </section>
             <section id="effects-page" class="page">
                 <h1>Effects Suite</h1>
+                <canvas id="visualizer-canvas"></canvas>
                 <div id="effects-container"></div>
             </section>
-            
+            <section id="youtube-page" class="page">
+                <div class="downloader-container"></div>
+            </section>
+            <section id="soundcloud-page" class="page">
+                <div class="downloader-container"></div>
+            </section>
         </main>
         <div class="player-bar">
-            <canvas id="visualizer-canvas"></canvas>
-            <div class="current-track-info">
-                <div id="player-song-title">No Song Playing</div>
-            </div>
             <div id="progress-bar-wrapper"><div id="progress-bar-fill"></div></div>
+            <div class="current-track-info"><div id="player-song-title">No Song Playing</div></div>
             <div class="player-controls">
                 <button id="prev-btn" class="control-btn"><svg fill="currentColor" viewBox="0 0 20 20"><path d="M8.445 14.832A1 1 0 0010 14.033V5.967a1 1 0 00-1.555-.832L4 9.167V5a1 1 0 00-2 0v10a1 1 0 002 0v-4.167l4.445 4.032z"></path></svg></button>
                 <button id="play-pause-btn" class="control-btn play-pause-btn"><svg id="play-pause-icon" fill="currentColor" viewBox="0 0 20 20"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8.13v3.74a1 1 0 001.555.832l3.197-1.87a1 1 0 000-1.664l-3.197-1.87z" clip-rule="evenodd"></path></svg></button>
                 <button id="next-btn" class="control-btn"><svg fill="currentColor" viewBox="0 0 20 20"><path d="M11.555 5.168A1 1 0 0010 5.967v8.066a1 1 0 001.555.832l4.445-4.033a1 1 0 000-1.664l-4.445-4.033zM4.445 14.832A1 1 0 006 14.033V5.967a1 1 0 00-1.555-.832L0 9.167V5a1 1 0 00-2 0v10a1 1 0 002 0v-4.167l4.445 4.032z"></path></svg></button>
             </div>
             <div class="secondary-controls">
-                <input type="range" id="volume-slider" class="custom-slider" min="0" max="1" step="0.01" value="1">
+                <button id="menu-btn" class="control-btn"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg></button>
+                <button id="expand-btn" class="control-btn"><svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 8V4h4m12 4V4h-4M4 16v4h4m12-4v4h-4"></path></svg></button>
             </div>
         </div>
     </div>
@@ -571,83 +210,29 @@ html_template = """
         const PLAY_ICON_PATH = `<path d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8.13v3.74a1 1 0 001.555.832l3.197-1.87a1 1 0 000-1.664l-3.197-1.87z" clip-rule="evenodd"></path>`;
         const PAUSE_ICON_PATH = `<path d="M10 18a8 8 0 100-16 8 8 0 000 16zM7 9a1 1 0 00-1 1v4a1 1 0 102 0v-4a1 1 0 00-1-1zm5 0a1 1 0 00-1 1v4a1 1 0 102 0v-4a1 1 0 00-1-1z" clip-rule="evenodd"></path>`;
 
-        
-        let audioContext, sourceNode, gainNode, analyser, distortion, reverb, wetGain, dryGain, compressor, panner, eqBands;
-        let isPlaying = false, currentBuffer = null, startTime = 0, pauseOffset = 0, animationFrameId;
-
-        const socketio = io();
-
-        socketio.on('download_start', (data) => {
-            addDownloadItem(data.filename);
-        });
-
-        socketio.on('download_progress', (data) => {
-            const item = document.getElementById(`download-${data.filename}`);
-            if (item) {
-                const progressBarFill = item.querySelector('.progress-bar-fill');
-                const status = item.querySelector('.status');
-                progressBarFill.style.width = `${data.percentage}%`;
-                status.textContent = `Downloading... ${data.percentage.toFixed(2)}% at ${data.speed_kb.toFixed(2)} KB/s`;
-            }
-        });
-
-        socketio.on('download_finished', (data) => {
-            const item = document.getElementById(`download-${data.filename}`);
-            if (item) {
-                item.remove();
-            }
-            updatePlaylist();
-        });
-
-        socketio.on('download_error', (data) => {
-            alert(`Download failed: ${data.message}`);
-            const item = document.getElementById(`download-${data.filename}`);
-            if (item) {
-                item.remove();
-            }
-        });
-
-        function addDownloadItem(filename) {
-            const queue = document.getElementById('download-queue');
-            const item = document.createElement('div');
-            item.className = 'download-item';
-            item.id = `download-${filename}`;
-            item.innerHTML = `
-                <div class="icon"><div class="install-animation"></div></div>
-                <div class="info">
-                    <div class="title">${filename}</div>
-                    <div class="status">Preparing...</div>
-                </div>
-                <div class="progress-bar"><div class="progress-bar-fill"></div></div>
-            `;
-            queue.appendChild(item);
-        }
-
-        function initialize() {
-            const effectsContainer = document.getElementById('effects-container');
-            effectsContainer.innerHTML = `
+        // --- DYNAMIC CONTENT ---
+        function rehydrateContent() {
+            document.getElementById('effects-container').innerHTML = `
                 <div class="effect-module"><h3>Playback</h3><div class="slider-group"><div class="slider-label-group"><span>Speed</span><span id="speed-val">1.0x</span></div><input type="range" id="speed-slider" class="custom-slider" min="0.5" max="2" step="0.01" value="1"></div></div>
                 <div class="effect-module"><h3>Ambiance & Tone</h3><div class="slider-group" style="gap: 16px;"><div class="slider-label-group"><span>Reverb</span><span id="reverb-val">0%</span></div><input type="range" id="reverb-slider" class="custom-slider" min="0" max="1" step="0.01" value="0"><div class="slider-label-group"><span>Distortion</span><span id="distortion-val">0%</span></div><input type="range" id="distortion-slider" class="custom-slider" min="0" max="1" step="0.01" value="0"></div></div>
-                <div class="effect-module"><h3>10-Band Equalizer</h3><div id="eq-container"></div></div>
-                <div class="effect-module"><h3>Compressor</h3><div class="slider-group"><div class="slider-label-group"><span>Threshold</span><span id="comp-thresh-val">-24 dB</span></div><input type="range" id="comp-thresh-slider" class="custom-slider" min="-100" max="0" step="1" value="-24"><div class="slider-label-group"><span>Knee</span><span id="comp-knee-val">30</span></div><input type="range" id="comp-knee-slider" class="custom-slider" min="0" max="40" step="1" value="30"><div class="slider-label-group"><span>Ratio</span><span id="comp-ratio-val">12</span></div><input type="range" id="comp-ratio-slider" class="custom-slider" min="1" max="20" step="1" value="12"><div class="slider-label-group"><span>Attack</span><span id="comp-attack-val">0.003 s</span></div><input type="range" id="comp-attack-slider" class="custom-slider" min="0" max="1" step="0.001" value="0.003"><div class="slider-label-group"><span>Release</span><span id="comp-release-val">0.25 s</span></div><input type="range" id="comp-release-slider" class="custom-slider" min="0" max="1" step="0.01" value="0.25"></div></div>
-                <div class="effect-module"><h3>Panner</h3><div class="slider-group"><div class="slider-label-group"><span>Pan</span><span id="pan-val">0</span></div><input type="range" id="pan-slider" class="custom-slider" min="-1" max="1" step="0.01" value="0"></div></div>`;
+                <div class="effect-module"><h3>Tone Shaping</h3><div class="slider-group" style="gap: 16px;"><div class="slider-label-group"><span>Lows</span><span id="lows-val">0 dB</span></div><input type="range" id="lows-slider" class="custom-slider" min="-20" max="20" step="0.5" value="0"><div class="slider-label-group"><span>Highs</span><span id="highs-val">0 dB</span></div><input type="range" id="highs-slider" class="custom-slider" min="-20" max="20" step="0.5" value="0"></div></div>`;
 
-            const eqContainer = document.getElementById('eq-container');
-            const frequencies = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
-            for (let i = 0; i < frequencies.length; i++) {
-                const freq = frequencies[i];
-                const eqBand = document.createElement('div');
-                eqBand.className = 'eq-band';
-                eqBand.innerHTML = `
-                    <label>${freq < 1000 ? freq : (freq / 1000) + 'k'}Hz</label>
-                    <input type="range" class="eq-slider" min="-20" max="20" step="0.5" value="0" data-index="${i}">
-                `;
-                eqContainer.appendChild(eqBand);
-            }
+            document.querySelector('#youtube-page .downloader-container').innerHTML = `<h1>Download from YouTube</h1><p class="downloader-prompt">Paste a YouTube URL or song title to download it as an MP3.</p><div class="download-form"><input type="text" id="youtube-input" class="downloader-input" placeholder="Enter URL or title..."><button id="youtube-download-btn" class="download-button">Download</button></div>`;
+            document.querySelector('#soundcloud-page .downloader-container').innerHTML = `<h1>Download from SoundCloud</h1><p class="downloader-prompt">Paste a SoundCloud URL or track name to download it as an MP3.</p><div class="download-form"><input type="text" id="soundcloud-input" class="downloader-input" placeholder="Enter URL or track name..."><button id="soundcloud-download-btn" class="download-button">Download</button></div>`;
+        }
 
+        const canvas = document.getElementById('visualizer-canvas');
+        const canvasCtx = canvas.getContext('2d');
+        let audioFileNames = {{ initial_audio_files|safe }};
+        let audioData = {{ initial_audio_data|safe }};
+        let currentTrackIndex = -1, isShuffleOn = false, isAutoplayOn = true;
+        let audioContext, sourceNode, gainNode, lowFilter, highFilter, analyser, distortion, reverb, wetGain, dryGain;
+        let isPlaying = false, currentBuffer = null, startTime = 0, pauseOffset = 0, animationFrameId;
+
+        function initialize() {
+            rehydrateContent();
             setupEventListeners();
             renderSongList();
-            setupMediaSession();
         }
 
         function initAudio() {
@@ -655,37 +240,24 @@ html_template = """
             audioContext = new (window.AudioContext || window.webkitAudioContext)();
             gainNode = audioContext.createGain();
             analyser = audioContext.createAnalyser();
+            lowFilter = audioContext.createBiquadFilter();
+            highFilter = audioContext.createBiquadFilter();
             distortion = audioContext.createWaveShaper();
             reverb = audioContext.createConvolver();
             wetGain = audioContext.createGain();
             dryGain = audioContext.createGain();
-            compressor = audioContext.createDynamicsCompressor();
-            panner = audioContext.createStereoPanner();
-
-            const frequencies = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
-            eqBands = frequencies.map(freq => {
-                const filter = audioContext.createBiquadFilter();
-                filter.type = 'peaking';
-                filter.frequency.value = freq;
-                filter.Q.value = 1;
-                filter.gain.value = 0;
-                return filter;
-            });
 
             analyser.fftSize = 256;
+            lowFilter.type = "lowshelf"; lowFilter.frequency.value = 320;
+            highFilter.type = "highshelf"; highFilter.frequency.value = 3200;
 
             createReverbImpulse().then(buffer => { reverb.buffer = buffer; });
 
             sourceNode = audioContext.createBufferSource();
-            
-            // Connect nodes
-            sourceNode.connect(gainNode);
-            let lastNode = gainNode;
-            eqBands.forEach(filter => {
-                lastNode.connect(filter);
-                lastNode = filter;
-            });
-            lastNode.connect(panner).connect(compressor).connect(distortion).connect(analyser);
+            sourceNode.connect(gainNode)
+                .connect(distortion)
+                .connect(lowFilter).connect(highFilter)
+                .connect(analyser);
 
             analyser.connect(dryGain).connect(audioContext.destination);
             analyser.connect(wetGain).connect(reverb).connect(audioContext.destination);
@@ -714,7 +286,6 @@ html_template = """
                 currentBuffer = await audioContext.decodeAudioData(arrayBuffer);
                 startPlayback(offset);
                 document.getElementById('player-song-title').textContent = fileName.replace('.mp3', '');
-                updateMediaSession();
             } catch (e) {
                 document.getElementById('player-song-title').textContent = `Error: ${e.message}`;
             }
@@ -789,17 +360,26 @@ html_template = """
 
             document.getElementById('song-list').addEventListener('click', async e => {
                 const playButton = e.target.closest('.play-btn');
+                const deleteButton = e.target.closest('.delete-btn');
                 if (playButton) {
                     playSong(parseInt(playButton.dataset.index));
+                }
+                if (deleteButton) {
+                    if (confirm(`Delete "${deleteButton.dataset.name}"?`)) {
+                        await fetch('/api/delete', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ filename: deleteButton.dataset.name })
+                        });
+                        updatePlaylist();
+                    }
                 }
             });
 
             document.getElementById('play-pause-btn').addEventListener('click', togglePlayPause);
             document.getElementById('next-btn').addEventListener('click', playNext);
             document.getElementById('prev-btn').addEventListener('click', playPrev);
-            document.getElementById('volume-slider').addEventListener('input', e => {
-                if(gainNode) gainNode.gain.value = e.target.value;
-            });
+            document.getElementById('expand-btn').addEventListener('click', () => { document.documentElement.requestFullscreen(); });
 
             document.getElementById('progress-bar-wrapper').addEventListener('click', e => {
                 if (!currentBuffer) return;
@@ -813,27 +393,41 @@ html_template = """
 
             // Effects
             document.getElementById('speed-slider').addEventListener('input', e => updateSpeed(e.target.value));
+            document.getElementById('lows-slider').addEventListener('input', e => updateEffect(lowFilter.gain, e.target.value, v => `${v} dB`, '#lows-val'));
+            document.getElementById('highs-slider').addEventListener('input', e => updateEffect(highFilter.gain, e.target.value, v => `${v} dB`, '#highs-val'));
             document.getElementById('reverb-slider').addEventListener('input', e => updateReverb(e.target.value));
             document.getElementById('distortion-slider').addEventListener('input', e => updateDistortion(e.target.value));
-            document.querySelectorAll('.eq-slider').forEach(slider => {
-                slider.addEventListener('input', e => {
-                    if (eqBands) eqBands[e.target.dataset.index].gain.value = e.target.value;
-                });
-            });
-            document.getElementById('comp-thresh-slider').addEventListener('input', e => updateCompressor('threshold', e.target.value, v => `${v} dB`, '#comp-thresh-val'));
-            document.getElementById('comp-knee-slider').addEventListener('input', e => updateCompressor('knee', e.target.value, v => v, '#comp-knee-val'));
-            document.getElementById('comp-ratio-slider').addEventListener('input', e => updateCompressor('ratio', e.target.value, v => v, '#comp-ratio-val'));
-            document.getElementById('comp-attack-slider').addEventListener('input', e => updateCompressor('attack', e.target.value, v => `${v} s`, '#comp-attack-val'));
-            document.getElementById('comp-release-slider').addEventListener('input', e => updateCompressor('release', e.target.value, v => `${v} s`, '#comp-release-val'));
-            document.getElementById('pan-slider').addEventListener('input', e => updatePanner(e.target.value));
 
-            // Downloader
-            document.getElementById('search-library').addEventListener('keypress', e => {
-                if (e.key === 'Enter') {
-                    const query = e.target.value.trim();
-                    if (query) {
-                        socketio.emit('download_song', { query: query, source: 'ytsearch' });
-                        e.target.value = '';
+            // Downloaders
+            document.getElementById('youtube-download-btn').addEventListener('click', async () => { 
+                const query = document.getElementById('youtube-input').value; 
+                if (query) {
+                    const response = await fetch('/api/download', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query: query, source: 'ytsearch' })
+                    });
+                    const result = await response.json();
+                    if (result.status === 'success') {
+                        updatePlaylist();
+                    } else {
+                        alert(`Download failed: ${result.message}`);
+                    }
+                }
+            });
+            document.getElementById('soundcloud-download-btn').addEventListener('click', async () => {
+                const query = document.getElementById('soundcloud-input').value;
+                if (query) {
+                    const response = await fetch('/api/download', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ query: query, source: 'scsearch' })
+                    });
+                    const result = await response.json();
+                    if (result.status === 'success') {
+                        updatePlaylist();
+                    } else {
+                        alert(`Download failed: ${result.message}`);
                     }
                 }
             });
@@ -884,7 +478,8 @@ html_template = """
                 item.className = 'song-list-item';
                 item.innerHTML = `
                     <button class="play-btn" data-index="${index}"><svg fill="currentColor" viewBox="0 0 20 20"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8.13v3.74a1 1 0 001.555.832l3.197-1.87a1 1 0 000-1.664l-3.197-1.87z" clip-rule="evenodd"></path></svg></button>
-                    <div class="song-details"><div class="title">${name.replace('.mp3','')}</div></div>`;
+                    <div class="song-details"><div class="title">${name.replace('.mp3','')}</div></div>
+                    <button class="delete-btn" data-name="${name}"><svg fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd"></path></svg></button>`;
                 listEl.appendChild(item);
             });
         }
@@ -911,52 +506,21 @@ html_template = """
             playSong(prevIndex);
         }
 
-        function setupMediaSession() {
-            if ('mediaSession' in navigator) {
-                navigator.mediaSession.setActionHandler('play', () => { togglePlayPause(); });
-                navigator.mediaSession.setActionHandler('pause', () => { togglePlayPause(); });
-                navigator.mediaSession.setActionHandler('previoustrack', () => { playPrev(); });
-                navigator.mediaSession.setActionHandler('nexttrack', () => { playNext(); });
-            }
-        }
-
-        function updateMediaSession() {
-            if ('mediaSession' in navigator) {
-                const track = audioFileNames[currentTrackIndex];
-                navigator.mediaSession.metadata = new MediaMetadata({
-                    title: track.replace('.mp3', ''),
-                    artist: 'Studio AURA',
-                    album: 'Library'
-                });
-            }
-        }
-
         function resetEffects() {
-            document.querySelectorAll('.eq-slider').forEach(slider => slider.value = 0);
-            if (eqBands) eqBands.forEach(filter => filter.gain.value = 0);
-            
-            document.getElementById('speed-slider').value = 1;
-            updateSpeed(1);
-
-            document.getElementById('reverb-slider').value = 0;
+            const sliders = {
+                'speed-slider': { value: 1 },
+                'lows-slider': { value: 0, node: lowFilter.gain, format: v => `${v} dB`, valId: '#lows-val' },
+                'highs-slider': { value: 0, node: highFilter.gain, format: v => `${v} dB`, valId: '#highs-val' },
+                'reverb-slider': { value: 0 },
+                'distortion-slider': { value: 0 },
+            };
+            for (const [id, config] of Object.entries(sliders)) {
+                document.getElementById(id).value = config.value;
+                if(config.node) updateEffect(config.node, config.value, config.format, config.valId);
+            }
             updateReverb(0);
-
-            document.getElementById('distortion-slider').value = 0;
             updateDistortion(0);
-
-            document.getElementById('comp-thresh-slider').value = -24;
-            updateCompressor('threshold', -24, v => `${v} dB`, '#comp-thresh-val');
-            document.getElementById('comp-knee-slider').value = 30;
-            updateCompressor('knee', 30, v => v, '#comp-knee-val');
-            document.getElementById('comp-ratio-slider').value = 12;
-            updateCompressor('ratio', 12, v => v, '#comp-ratio-val');
-            document.getElementById('comp-attack-slider').value = 0.003;
-            updateCompressor('attack', 0.003, v => `${v} s`, '#comp-attack-val');
-            document.getElementById('comp-release-slider').value = 0.25;
-            updateCompressor('release', 0.25, v => `${v} s`, '#comp-release-val');
-
-            document.getElementById('pan-slider').value = 0;
-            updatePanner(0);
+            updateSpeed(1);
         }
 
         function updateEffect(audioParam, value, formatFn, valId) {
@@ -990,20 +554,6 @@ html_template = """
                 wetGain.gain.value = amount;
             }
             updateEffect(null, amount, v => `${Math.round(v*100)}%`, '#reverb-val');
-        }
-
-        function updateCompressor(param, value, formatFn, valId) {
-            if (compressor && compressor[param]) {
-                compressor[param].value = value;
-            }
-            updateEffect(null, value, formatFn, valId);
-        }
-
-        function updatePanner(value) {
-            if (panner) {
-                panner.pan.value = value;
-            }
-            updateEffect(null, value, v => v, '#pan-val');
         }
 
         async function createReverbImpulse() {
