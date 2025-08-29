@@ -581,4 +581,497 @@ html_template = """
             <div id="progress-bar-wrapper"><div id="progress-bar-fill"></div></div>
             <div class="player-controls">
                 <button id="prev-btn" class="control-btn"><svg fill="currentColor" viewBox="0 0 20 20"><path d="M8.445 14.832A1 1 0 0010 14.033V5.967a1 1 0 00-1.555-.832L4 9.167V5a1 1 0 00-2 0v10a1 1 0 002 0v-4.167l4.445 4.032z"></path></svg></button>
-                <button id="play-pause-btn" class="control-btn play-pause-btn"><svg id="play-pause-icon" fill="currentColor" viewBox="0 0 20 20"><path d="M10 18a8 8 0 100-
+                <button id="play-pause-btn" class="control-btn play-pause-btn"><svg id="play-pause-icon" fill="currentColor" viewBox="0 0 20 20"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8.13v3.74a1 1 0 001.555.832l3.197-1.87a1 1 0 000-1.664l-3.197-1.87z" clip-rule="evenodd"></path></svg></button>
+                <button id="next-btn" class="control-btn"><svg fill="currentColor" viewBox="0 0 20 20"><path d="M11.555 5.168A1 1 0 0010 5.967v8.066a1 1 0 001.555.832l4.445-4.033a1 1 0 000-1.664l-4.445-4.033zM4.445 14.832A1 1 0 006 14.033V5.967a1 1 0 00-1.555-.832L0 9.167V5a1 1 0 00-2 0v10a1 1 0 002 0v-4.167l4.445 4.032z"></path></svg></button>
+            </div>
+            <div class="secondary-controls">
+                <input type="range" id="volume-slider" class="custom-slider" min="0" max="1" step="0.01" value="1">
+            </div>
+        </div>
+    </div>
+    <script>
+        // --- DATA PLACEHOLDERS ---
+        let audioFileNames = {{ initial_audio_files|safe }};
+        let audioData = {{ initial_audio_data|safe }};
+
+        // --- GLOBAL STATE ---
+        let currentTrackIndex = -1;
+        let isAutoplayOn = true; 
+
+        // --- CONSTANTS & DOM ELEMENTS ---
+        const PLAY_ICON_PATH = `<path d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8.13v3.74a1 1 0 001.555.832l3.197-1.87a1 1 0 000-1.664l-3.197-1.87z" clip-rule="evenodd"></path>`;
+        const PAUSE_ICON_PATH = `<path d="M10 18a8 8 0 100-16 8 8 0 000 16zM7 9a1 1 0 00-1 1v4a1 1 0 102 0v-4a1 1 0 00-1-1zm5 0a1 1 0 00-1 1v4a1 1 0 102 0v-4a1 1 0 00-1-1z" clip-rule="evenodd"></path>`;
+        const canvas = document.getElementById('visualizer-canvas');
+        const canvasCtx = canvas.getContext('2d');
+
+        // --- WEB AUDIO API STATE ---
+        let audioContext, sourceNode, gainNode, analyser, distortion, reverb, wetGain, dryGain, compressor, panner, eqBands;
+        let isPlaying = false, currentBuffer = null, startTime = 0, pauseOffset = 0, animationFrameId;
+
+        // --- SOCKET.IO ---
+        const socketio = io();
+
+        socketio.on('download_start', (data) => {
+            addDownloadItem(data.filename);
+        });
+
+        socketio.on('download_progress', (data) => {
+            const item = document.getElementById(`download-${data.filename}`);
+            if (item) {
+                const progressBarFill = item.querySelector('.progress-bar-fill');
+                const status = item.querySelector('.status');
+                progressBarFill.style.width = `${data.percentage}%`;
+                status.textContent = `Downloading... ${data.percentage.toFixed(1)}% at ${(data.speed_kb / 1024).toFixed(2)} MB/s`;
+            }
+        });
+
+        socketio.on('download_finished', (data) => {
+            const item = document.getElementById(`download-${data.filename}`);
+            if (item) {
+                item.remove();
+            }
+            updatePlaylist();
+        });
+
+        socketio.on('download_error', (data) => {
+            alert(`Download failed for "${data.filename}": ${data.message}`);
+            const item = document.getElementById(`download-${data.filename}`);
+            if (item) {
+                item.remove();
+            }
+        });
+
+        function addDownloadItem(filename) {
+            const queue = document.getElementById('download-queue');
+            
+            // Prevent duplicate entries
+            if (document.getElementById(`download-${filename}`)) return;
+
+            const item = document.createElement('div');
+            item.className = 'download-item';
+            item.id = `download-${filename}`;
+            item.innerHTML = `
+                <div class="icon"><div class="install-animation"></div></div>
+                <div class="info">
+                    <div class="title">${filename}</div>
+                    <div class="status">Preparing...</div>
+                </div>
+                <div class="progress-bar"><div class="progress-bar-fill" style="width: 0%;"></div></div>
+            `;
+            queue.appendChild(item);
+        }
+
+        // --- INITIALIZATION ---
+        function initialize() {
+            const effectsContainer = document.getElementById('effects-container');
+            effectsContainer.innerHTML = `
+                <div class="effect-module"><h3>Playback</h3><div class="slider-group"><div class="slider-label-group"><span>Speed</span><span id="speed-val">1.0x</span></div><input type="range" id="speed-slider" class="custom-slider" min="0.5" max="2" step="0.01" value="1"></div></div>
+                <div class="effect-module"><h3>Ambiance & Tone</h3><div class="slider-group" style="gap: 16px;"><div class="slider-label-group"><span>Reverb</span><span id="reverb-val">0%</span></div><input type="range" id="reverb-slider" class="custom-slider" min="0" max="1" step="0.01" value="0"><div class="slider-label-group"><span>Distortion</span><span id="distortion-val">0%</span></div><input type="range" id="distortion-slider" class="custom-slider" min="0" max="1" step="0.01" value="0"></div></div>
+                <div class="effect-module"><h3>10-Band Equalizer</h3><div id="eq-container"></div></div>
+                <div class="effect-module"><h3>Compressor</h3><div class="slider-group"><div class="slider-label-group"><span>Threshold</span><span id="comp-thresh-val">-24 dB</span></div><input type="range" id="comp-thresh-slider" class="custom-slider" min="-100" max="0" step="1" value="-24"><div class="slider-label-group"><span>Knee</span><span id="comp-knee-val">30</span></div><input type="range" id="comp-knee-slider" class="custom-slider" min="0" max="40" step="1" value="30"><div class="slider-label-group"><span>Ratio</span><span id="comp-ratio-val">12</span></div><input type="range" id="comp-ratio-slider" class="custom-slider" min="1" max="20" step="1" value="12"><div class="slider-label-group"><span>Attack</span><span id="comp-attack-val">0.003 s</span></div><input type="range" id="comp-attack-slider" class="custom-slider" min="0" max="1" step="0.001" value="0.003"><div class="slider-label-group"><span>Release</span><span id="comp-release-val">0.25 s</span></div><input type="range" id="comp-release-slider" class="custom-slider" min="0" max="1" step="0.01" value="0.25"></div></div>
+                <div class="effect-module"><h3>Panner</h3><div class="slider-group"><div class="slider-label-group"><span>Pan</span><span id="pan-val">0</span></div><input type="range" id="pan-slider" class="custom-slider" min="-1" max="1" step="0.01" value="0"></div></div>`;
+
+            const eqContainer = document.getElementById('eq-container');
+            const frequencies = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+            for (let i = 0; i < frequencies.length; i++) {
+                const freq = frequencies[i];
+                const eqBand = document.createElement('div');
+                eqBand.className = 'eq-band';
+                eqBand.innerHTML = `
+                    <label>${freq < 1000 ? freq : (freq / 1000) + 'k'}Hz</label>
+                    <input type="range" class="eq-slider" min="-20" max="20" step="0.5" value="0" data-index="${i}">
+                `;
+                eqContainer.appendChild(eqBand);
+            }
+
+            setupEventListeners();
+            renderSongList();
+            setupMediaSession();
+        }
+
+        function initAudio() {
+            if (audioContext) return;
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            gainNode = audioContext.createGain();
+            analyser = audioContext.createAnalyser();
+            distortion = audioContext.createWaveShaper();
+            reverb = audioContext.createConvolver();
+            wetGain = audioContext.createGain();
+            dryGain = audioContext.createGain();
+            compressor = audioContext.createDynamicsCompressor();
+            panner = audioContext.createStereoPanner();
+
+            const frequencies = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+            eqBands = frequencies.map(freq => {
+                const filter = audioContext.createBiquadFilter();
+                filter.type = 'peaking';
+                filter.frequency.value = freq;
+                filter.Q.value = 1;
+                filter.gain.value = 0;
+                return filter;
+            });
+
+            analyser.fftSize = 256;
+
+            createReverbImpulse().then(buffer => { reverb.buffer = buffer; });
+            
+            // Connect nodes in a chain
+            let lastNode = gainNode;
+            eqBands.forEach(filter => {
+                lastNode.connect(filter);
+                lastNode = filter;
+            });
+            lastNode.connect(panner).connect(compressor).connect(distortion).connect(analyser);
+
+            analyser.connect(dryGain).connect(audioContext.destination);
+            analyser.connect(wetGain).connect(reverb).connect(audioContext.destination);
+
+            resetEffects();
+        }
+        
+        // --- AUDIO PLAYBACK ---
+        async function playSong(index, offset = 0) {
+            if (index < 0 || index >= audioFileNames.length) return;
+            if (!audioContext) initAudio();
+            if (isPlaying) stopSong();
+
+            currentTrackIndex = index;
+            const fileName = audioFileNames[index];
+            const dataUrl = audioData[fileName];
+
+            if (!dataUrl) {
+                document.getElementById('player-song-title').textContent = "Error: File data missing";
+                return;
+            }
+
+            try {
+                document.getElementById('player-song-title').textContent = "Loading...";
+                const base64Data = dataUrl.split(',')[1];
+                const arrayBuffer = base64ToArrayBuffer(base64Data);
+                currentBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                startPlayback(offset);
+                document.getElementById('player-song-title').textContent = fileName.replace('.mp3', '');
+                updateMediaSession();
+            } catch (e) {
+                document.getElementById('player-song-title').textContent = `Error: ${e.message}`;
+            }
+        }
+
+        function startPlayback(offset) {
+            if (!currentBuffer) return;
+            sourceNode = audioContext.createBufferSource();
+            sourceNode.buffer = currentBuffer;
+            sourceNode.playbackRate.value = document.getElementById('speed-slider').value;
+            sourceNode.connect(gainNode);
+
+            sourceNode.onended = () => {
+                // Check if the song ended naturally (not stopped by the user)
+                if (isPlaying && (audioContext.currentTime - startTime) >= currentBuffer.duration / sourceNode.playbackRate.value - 0.1) {
+                    if (isAutoplayOn) playNext(); else stopSong(true);
+                }
+            };
+
+            sourceNode.start(0, offset);
+            startTime = audioContext.currentTime - offset;
+            pauseOffset = 0;
+            isPlaying = true;
+            document.getElementById('play-pause-icon').innerHTML = PAUSE_ICON_PATH;
+            updateVisuals();
+        }
+
+        function stopSong(isEndOfTrack = false) {
+            if (sourceNode) {
+                sourceNode.onended = null; // Prevent onended from firing on manual stop
+                try { sourceNode.stop(); } catch(e) {}
+                sourceNode.disconnect();
+                sourceNode = null;
+            }
+            if (isPlaying) {
+                pauseOffset = audioContext.currentTime - startTime;
+            }
+            isPlaying = false;
+            if (isEndOfTrack) {
+                pauseOffset = 0;
+                document.getElementById('progress-bar-fill').style.width = '0%';
+            }
+            document.getElementById('play-pause-icon').innerHTML = PLAY_ICON_PATH;
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+        }
+        
+        async function updatePlaylist() {
+            try {
+                const response = await fetch('/api/get-audio-files');
+                const data = await response.json();
+                const oldTrackName = currentTrackIndex > -1 ? audioFileNames[currentTrackIndex] : null;
+                
+                audioFileNames = data.files;
+                audioData = data.data;
+
+                if (oldTrackName && !audioFileNames.includes(oldTrackName)) {
+                    // The currently playing song was deleted, so stop everything.
+                    stopSong(true);
+                    currentBuffer = null;
+                    currentTrackIndex = -1;
+                    document.getElementById('player-song-title').textContent = 'No Song Playing';
+                } else if (oldTrackName) {
+                    // Re-sync the index in case the list order changed
+                    currentTrackIndex = audioFileNames.indexOf(oldTrackName);
+                }
+                renderSongList();
+            } catch (error) {
+                console.error("Failed to update playlist:", error);
+            }
+        }
+
+        // --- EVENT LISTENERS ---
+        function setupEventListeners() {
+            document.querySelectorAll('.nav-item').forEach(item => item.addEventListener('click', e => {
+                document.querySelector('.nav-item.active').classList.remove('active');
+                e.currentTarget.classList.add('active');
+                document.querySelector('.page.active').classList.remove('active');
+                document.getElementById(e.currentTarget.dataset.page).classList.add('active');
+            }));
+
+            document.getElementById('song-list').addEventListener('click', async e => {
+                const playButton = e.target.closest('.play-btn');
+                if (playButton) {
+                    playSong(parseInt(playButton.dataset.index));
+                }
+            });
+
+            document.getElementById('play-pause-btn').addEventListener('click', togglePlayPause);
+            document.getElementById('next-btn').addEventListener('click', playNext);
+            document.getElementById('prev-btn').addEventListener('click', playPrev);
+            document.getElementById('volume-slider').addEventListener('input', e => {
+                if(gainNode) gainNode.gain.value = e.target.value;
+            });
+
+            document.getElementById('progress-bar-wrapper').addEventListener('click', e => {
+                if (!currentBuffer || !isPlaying) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = e.clientX - rect.left;
+                const width = rect.width;
+                const progress = Math.max(0, Math.min(1, x / width));
+                const seekTime = currentBuffer.duration * progress;
+                // Restart the song from the new position
+                playSong(currentTrackIndex, seekTime);
+            });
+
+            // Effects
+            document.getElementById('speed-slider').addEventListener('input', e => updateSpeed(e.target.value));
+            document.getElementById('reverb-slider').addEventListener('input', e => updateReverb(e.target.value));
+            document.getElementById('distortion-slider').addEventListener('input', e => updateDistortion(e.target.value));
+            document.querySelectorAll('.eq-slider').forEach(slider => {
+                slider.addEventListener('input', e => {
+                    if (eqBands) eqBands[e.target.dataset.index].gain.value = e.target.value;
+                });
+            });
+            document.getElementById('comp-thresh-slider').addEventListener('input', e => updateCompressor('threshold', e.target.value, v => `${v} dB`, '#comp-thresh-val'));
+            document.getElementById('comp-knee-slider').addEventListener('input', e => updateCompressor('knee', e.target.value, v => v, '#comp-knee-val'));
+            document.getElementById('comp-ratio-slider').addEventListener('input', e => updateCompressor('ratio', e.target.value, v => v, '#comp-ratio-val'));
+            document.getElementById('comp-attack-slider').addEventListener('input', e => updateCompressor('attack', e.target.value, v => `${v} s`, '#comp-attack-val'));
+            document.getElementById('comp-release-slider').addEventListener('input', e => updateCompressor('release', e.target.value, v => `${v} s`, '#comp-release-val'));
+            document.getElementById('pan-slider').addEventListener('input', e => updatePanner(e.target.value));
+
+            // Downloader
+            document.getElementById('search-library').addEventListener('keypress', e => {
+                if (e.key === 'Enter') {
+                    const query = e.target.value.trim();
+                    if (query) {
+                        socketio.emit('download_song', { query: query });
+                        e.target.value = '';
+                    }
+                }
+            });
+        }
+        
+        // --- UI & VISUALS ---
+        function updateVisuals() {
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+
+            const draw = () => {
+                if (!isPlaying) return;
+                animationFrameId = requestAnimationFrame(draw);
+
+                if (currentBuffer && sourceNode) {
+                    const playbackRate = sourceNode.playbackRate.value;
+                    const elapsedTime = (audioContext.currentTime - startTime) * playbackRate;
+                    const duration = currentBuffer.duration;
+                    const progress = elapsedTime / duration;
+                    document.getElementById('progress-bar-fill').style.width = `${Math.min(progress * 100, 100)}%`;
+                }
+
+                analyser.getByteFrequencyData(dataArray);
+                canvasCtx.fillStyle = 'var(--bg-main)';
+                canvasCtx.fillRect(0, 0, canvas.width, canvas.height);
+                const barWidth = (canvas.width / bufferLength) * 2.5;
+                let x = 0;
+                for (let i = 0; i < bufferLength; i++) {
+                    const barHeight = dataArray[i];
+                    const green = barHeight + 50 * (i/bufferLength);
+                    const blue = barHeight / 2;
+                    canvasCtx.fillStyle = `rgb(50, ${green}, ${blue})`;
+                    canvasCtx.fillRect(x, canvas.height - barHeight / 2, barWidth, barHeight / 2);
+                    x += barWidth + 1;
+                }
+            };
+            draw();
+        }
+
+        function renderSongList() {
+            const listEl = document.getElementById('song-list');
+            listEl.innerHTML = '';
+            if (audioFileNames.length === 0) {
+                listEl.innerHTML = '<p style="color: var(--text-secondary); padding: 20px;">No music found. Paste a URL above to download.</p>';
+                return;
+            }
+
+            audioFileNames.forEach((name, index) => {
+                const item = document.createElement('div');
+                item.className = 'song-list-item';
+                item.innerHTML = `
+                    <button class="play-btn" data-index="${index}"><svg fill="currentColor" viewBox="0 0 20 20"><path d="M10 18a8 8 0 100-16 8 8 0 000 16zM9.555 7.168A1 1 0 008 8.13v3.74a1 1 0 001.555.832l3.197-1.87a1 1 0 000-1.664l-3.197-1.87z" clip-rule="evenodd"></path></svg></button>
+                    <div class="song-details"><div class="title">${name.replace('.mp3','')}</div></div>`;
+                listEl.appendChild(item);
+            });
+        }
+
+        // --- PLAYER CONTROLS ---
+        function togglePlayPause() {
+            if (currentTrackIndex === -1 && audioFileNames.length > 0) {
+                playSong(0);
+            } else if (isPlaying) {
+                stopSong();
+            } else if (currentBuffer) {
+                startPlayback(pauseOffset);
+            }
+        }
+
+        function playNext() {
+            if (audioFileNames.length === 0) return;
+            let nextIndex = (currentTrackIndex + 1) % audioFileNames.length;
+            playSong(nextIndex);
+        }
+
+        function playPrev() {
+            if (audioFileNames.length === 0) return;
+            const prevIndex = (currentTrackIndex - 1 + audioFileNames.length) % audioFileNames.length;
+            playSong(prevIndex);
+        }
+
+        // --- MEDIA SESSION & EFFECTS ---
+        function setupMediaSession() {
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.setActionHandler('play', () => { togglePlayPause(); });
+                navigator.mediaSession.setActionHandler('pause', () => { togglePlayPause(); });
+                navigator.mediaSession.setActionHandler('previoustrack', () => { playPrev(); });
+                navigator.mediaSession.setActionHandler('nexttrack', () => { playNext(); });
+            }
+        }
+
+        function updateMediaSession() {
+            if ('mediaSession' in navigator && currentTrackIndex > -1) {
+                const track = audioFileNames[currentTrackIndex];
+                navigator.mediaSession.metadata = new MediaMetadata({
+                    title: track.replace('.mp3', ''),
+                    artist: 'Studio AURA',
+                    album: 'Library'
+                });
+            }
+        }
+
+        function resetEffects() {
+            document.querySelectorAll('.eq-slider').forEach(slider => slider.value = 0);
+            if (eqBands) eqBands.forEach(filter => filter.gain.value = 0);
+            document.getElementById('speed-slider').value = 1; updateSpeed(1);
+            document.getElementById('reverb-slider').value = 0; updateReverb(0);
+            document.getElementById('distortion-slider').value = 0; updateDistortion(0);
+            document.getElementById('comp-thresh-slider').value = -24; updateCompressor('threshold', -24, v => `${v} dB`, '#comp-thresh-val');
+            document.getElementById('comp-knee-slider').value = 30; updateCompressor('knee', 30, v => v, '#comp-knee-val');
+            document.getElementById('comp-ratio-slider').value = 12; updateCompressor('ratio', 12, v => v, '#comp-ratio-val');
+            document.getElementById('comp-attack-slider').value = 0.003; updateCompressor('attack', 0.003, v => `${v} s`, '#comp-attack-val');
+            document.getElementById('comp-release-slider').value = 0.25; updateCompressor('release', 0.25, v => `${v} s`, '#comp-release-val');
+            document.getElementById('pan-slider').value = 0; updatePanner(0);
+        }
+
+        function updateEffect(audioParam, value, formatFn, valId) {
+            if (audioParam) audioParam.value = value;
+            if(formatFn && valId) document.querySelector(valId).textContent = formatFn(value);
+        }
+
+        function updateSpeed(rate) {
+            if (sourceNode) sourceNode.playbackRate.value = rate;
+            updateEffect(null, rate, v => `${parseFloat(v).toFixed(1)}x`, '#speed-val');
+        }
+
+        function updateDistortion(amount) {
+            const k = Number(amount) * 100;
+            const n_samples = 44100;
+            const curve = new Float32Array(n_samples);
+            const deg = Math.PI / 180;
+            for (let i = 0; i < n_samples; ++i) {
+                const x = i * 2 / n_samples - 1;
+                curve[i] = (3 + k) * x * 20 * deg / (Math.PI + k * Math.abs(x));
+            }
+            if (distortion) distortion.curve = curve;
+            updateEffect(null, amount, v => `${Math.round(v*100)}%`, '#distortion-val');
+        }
+
+        function updateReverb(amount) {
+            if (dryGain && wetGain) {
+                dryGain.gain.value = 1 - Math.pow(amount, 2);
+                wetGain.gain.value = amount;
+            }
+            updateEffect(null, amount, v => `${Math.round(v*100)}%`, '#reverb-val');
+        }
+
+        function updateCompressor(param, value, formatFn, valId) {
+            if (compressor && compressor[param]) compressor[param].value = value;
+            updateEffect(null, value, formatFn, valId);
+        }
+
+        function updatePanner(value) {
+            if (panner) panner.pan.value = value;
+            updateEffect(null, value, v => parseFloat(v).toFixed(2), '#pan-val');
+        }
+        
+        // --- HELPERS ---
+        async function createReverbImpulse() {
+            const sampleRate = audioContext.sampleRate;
+            const duration = 2;
+            const decay = 2;
+            const impulse = audioContext.createBuffer(2, duration * sampleRate, sampleRate);
+            for (let i = 0; i < 2; i++) {
+                const channel = impulse.getChannelData(i);
+                for (let j = 0; j < impulse.length; j++) {
+                    channel[j] = (Math.random() * 2 - 1) * Math.pow(1 - j / impulse.length, decay);
+                }
+            }
+            return impulse;
+        }
+
+        function base64ToArrayBuffer(base64) {
+            const binaryString = window.atob(base64);
+            const len = binaryString.length;
+            const bytes = new Uint8Array(len);
+            for (let i = 0; i < len; i++) { bytes[i] = binaryString.charCodeAt(i); }
+            return bytes.buffer;
+        }
+        
+        // --- STARTUP ---
+        document.addEventListener('DOMContentLoaded', initialize);
+    </script>
+</body>
+</html>
+"""
+
+def open_browser():
+      webbrowser.open_new("http://127.0.0.1:8080")
+
+if __name__ == '__main__':
+    print("✅ Studio AURA is launching...")
+    print("Open your web browser and go to http://127.0.0.1:8080")
+    # Uncomment the line below to automatically open a browser tab.
+    # threading.Timer(1, open_browser).start()
+    socketio.run(app, host='0.0.0.0', port=8080)
