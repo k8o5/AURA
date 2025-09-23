@@ -311,6 +311,22 @@ const htmlTemplate = `
             rehydrateContent();
             setupEventListeners();
             fetchAndRenderPlaylist();
+            setupMediaSession();
+        }
+
+        function setupMediaSession() {
+            if ('mediaSession' in navigator) {
+                navigator.mediaSession.setActionHandler('play', () => {
+                    if (currentTrackIndex === -1 && audioFileNames.length > 0) {
+                        playSong(0);
+                    } else {
+                        togglePlayPause();
+                    }
+                });
+                navigator.mediaSession.setActionHandler('pause', () => togglePlayPause());
+                navigator.mediaSession.setActionHandler('previoustrack', () => playPrev());
+                navigator.mediaSession.setActionHandler('nexttrack', () => playNext());
+            }
         }
 
         function initAudio() {
@@ -362,6 +378,18 @@ const htmlTemplate = `
                 currentBuffer = await audioContext.decodeAudioData(arrayBuffer);
                 startPlayback(offset);
                 document.getElementById('player-song-title').textContent = fileName.replace('.mp3', '');
+
+                if ('mediaSession' in navigator) {
+                    const artwork = [
+                        { src: 'data:image/svg+xml;charset=UTF-8,<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 24 24" fill="none" stroke="%231DB954" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><polygon points="10,8 16,12 10,16 10,8"></polygon></svg>', sizes: '96x96', type: 'image/svg+xml' },
+                    ];
+
+                    navigator.mediaSession.metadata = new MediaMetadata({
+                        title: fileName.replace('.mp3', ''),
+                        artwork: artwork
+                    });
+                    navigator.mediaSession.playbackState = 'playing';
+                }
             } catch (e) {
                 document.getElementById('player-song-title').textContent = ` + "`" + `Error: ${e.message}` + "`" + `;
             }
@@ -375,8 +403,10 @@ const htmlTemplate = `
             connectAudioNodes();
             
             sourceNode.onended = () => {
-                if (isPlaying && (audioContext.currentTime - startTime) >= currentBuffer.duration / sourceNode.playbackRate.value - 0.1) {
-                    if (isAutoplayOn) playNext(); else stopSong(true);
+                if (isAutoplayOn) {
+                    playNext();
+                } else {
+                    stopSong(true);
                 }
             };
             sourceNode.start(0, offset);
@@ -401,6 +431,14 @@ const htmlTemplate = `
             if (isEndOfTrack) {
                 pauseOffset = 0;
                 document.getElementById('progress-bar-fill').style.width = '0%';
+                if ('mediaSession' in navigator) {
+                    navigator.mediaSession.metadata = null;
+                    navigator.mediaSession.playbackState = 'none';
+                }
+            } else {
+                if ('mediaSession' in navigator) {
+                    navigator.mediaSession.playbackState = 'paused';
+                }
             }
             document.getElementById('play-pause-icon').innerHTML = PLAY_ICON_PATH;
             if (animationFrameId) cancelAnimationFrame(animationFrameId);
