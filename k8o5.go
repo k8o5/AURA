@@ -4,7 +4,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -43,7 +42,7 @@ func listSongsHandler(w http.ResponseWriter, r *http.Request) {
 
 	audioData := make(map[string]string)
 	for _, file := range files {
-		content, err := ioutil.ReadFile(file)
+		content, err := os.ReadFile(file)
 		if err != nil {
 			log.Printf("Konnte Datei %s nicht lesen: %v", file, err)
 			continue
@@ -63,7 +62,7 @@ func listSongsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// downloadHandler führt yt-dlp aus, um Audio herunterzuladen.
+	// downloadHandler führt yt-dlp aus, um Audio herunterzuladen.
 func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	var req DownloadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -77,7 +76,14 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	searchQuery := fmt.Sprintf("%s:%s", searchPrefix, req.Query)
 
-	cmd := exec.Command("yt-dlp",
+	ytdlpPath, err := exec.LookPath("yt-dlp")
+	if err != nil {
+		log.Println("yt-dlp not found in PATH")
+		http.Error(w, "yt-dlp not found in PATH", http.StatusInternalServerError)
+		return
+	}
+
+	cmd := exec.Command(ytdlpPath,
 		"--extract-audio",
 		"--audio-format", "mp3",
 		"--audio-quality", "192",
@@ -96,7 +102,6 @@ func downloadHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	fmt.Fprintf(w, `{"success": true, "message": "Download erfolgreich"}`)
 }
-
 // deleteHandler löscht eine angegebene .mp3-Datei.
 func deleteHandler(w http.ResponseWriter, r *http.Request) {
 	var req DeleteRequest
